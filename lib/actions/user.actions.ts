@@ -1,13 +1,13 @@
 'use server'
 
-import { ID } from "node-appwrite";
+import { ID, Query } from "node-appwrite";
 import { createAdminClient, createSessionClient } from "../appwrite";
 import { cookies } from "next/headers";
-import { encryptId, parseStringify } from "../utils";
+import { encryptId, extractCustomerIdFromUrl, parseStringify } from "../utils";
 import { CountryCode, ProcessorTokenCreateRequest, ProcessorTokenCreateRequestProcessorEnum, Products } from "plaid";
 import { plaidClient } from "../plaid";
 import { revalidatePath } from "next/cache";
-import { addFundingSource } from "./dwolla.actions";
+import { addFundingSource, createDwollaCustomer } from "./dwolla.actions";
 
 const {
     APPWRITE_DATABASE_ID: DATABASE_ID,
@@ -15,6 +15,21 @@ const {
     APPWRITE_BANK_COLLECTION_ID: BANK_COLLECTION_ID,
 } = process.env;
 
+// Define the user object
+export const getUserInfo = async ({ userId }: getUserInfoProps) => {
+    try {
+        const { database } = await createAdminClient();
+        const user = await database.listDocuments(
+            DATABASE_ID!,
+            USER_COLLECTION_ID!,
+            [Query.equal("userId", [userId])]
+        )
+
+        return parseStringify(user.documents[0]);
+    } catch (error) {
+        console.error("An error occurred while getting the banks:", error);
+    }
+}
 
 //Sign in a user with appwrite
 export const signIn = async ({ email, password }: signInProps) => {
@@ -29,27 +44,53 @@ export const signIn = async ({ email, password }: signInProps) => {
             secure: true,
         });
 
-        const response = await account.createEmailPasswordSession(email, password);
+        const user = await getUserInfo({ userId: session.userId });
 
-        return parseStringify(response);
+        return parseStringify(user);
     } catch (error) {
         console.log('error: ', error);
     }
 }
 
 //Sign up a new user with appwrite
-export const signUp = async (userData: SignUpParams) => {
-    const { email, password, firstName, lastName } = userData;
+export const signUp = async ({ password, ...userData }: SignUpParams) => {
+    const { email, firstName, lastName } = userData;
+
+    let newUserAccount;
+
     try {
         //Create a new user
-        const { account } = await createAdminClient();
+        const { account, database } = await createAdminClient();
 
-        const newUserAccount = await account.create(
+        newUserAccount = await account.create(
             ID.unique(),
             email,
             password,
             `${firstName} ${lastName}`
         );
+        if (!newUserAccount) throw Error;
+
+
+        const dwollaCustomerUrl = await createDwollaCustomer({
+            ...userData,
+            type: "personal",
+        })
+        if (!dwollaCustomerUrl) throw Error('An error occurred while creating a Dwolla customer.');
+
+        const dwollaCustomerId = extractCustomerIdFromUrl(dwollaCustomerUrl);
+
+        const newUser = await database.createDocument(
+            DATABASE_ID!,
+            USER_COLLECTION_ID!,
+            ID.unique(),
+            {
+                ...userData,
+                userId: newUserAccount.$id,
+                dwollaCustomerId,
+                dwollaCustomerUrl,
+            }
+        )
+
         const session = await account.createEmailPasswordSession(email, password);
 
         cookies().set("appwrite-session", session.secret, {
@@ -59,7 +100,7 @@ export const signUp = async (userData: SignUpParams) => {
             secure: true,
         });
 
-        return parseStringify(newUserAccount);
+        return parseStringify(newUser);
     } catch (error) {
         console.log('error: ', error);
     }
@@ -70,7 +111,9 @@ export const signUp = async (userData: SignUpParams) => {
 export async function getLoggedInUser() {
     try {
         const { account } = await createSessionClient();
-        const user = await account.get();
+        const result = await account.get();
+
+        const user = await getUserInfo({ userId: result.$id });
 
         return parseStringify(user);
     } catch (error) {
@@ -98,7 +141,7 @@ export const createLinkToken = async (user: User) => {
             user: {
                 client_user_id: user.$id,
             },
-            client_name: user.name,
+            client_name: `${user.firstName} ${user.lastName}`,
             products: ['auth'] as Products[],
             language: 'en',
             country_codes: ['US'] as CountryCode[],
@@ -203,5 +246,35 @@ export const exchangePublicToken = async ({
         });
     } catch (error) {
         console.error("An error occurred while creating exchanging token:", error);
+    }
+}
+
+export const getBanks = async ({ userId }: getBanksProps) => {
+    try {
+        const { database } = await createAdminClient();
+        const banks = await database.listDocuments(
+            DATABASE_ID!,
+            BANK_COLLECTION_ID!,
+            [Query.equal("userId", [userId])]
+        )
+
+        return parseStringify(banks.documents);
+    } catch (error) {
+        console.error("An error occurred while getting the banks:", error);
+    }
+}
+
+export const getBank = async ({ documentId }: getBankProps) => {
+    try {
+        const { database } = await createAdminClient();
+        const bank = await database.listDocuments(
+            DATABASE_ID!,
+            BANK_COLLECTION_ID!,
+            [Query.equal("$id", [documentId])]
+        )
+
+        return parseStringify(bank.documents[0]);
+    } catch (error) {
+        console.error("An error occurred while getting the banks:", error);
     }
 }
